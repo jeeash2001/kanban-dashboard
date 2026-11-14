@@ -15,7 +15,7 @@ pipeline {
         REGISTRY_CREDENTIALS = 'dockerhub-creds'
         CONTAINER_NAME = 'kanban-dashboard'
         CANDIDATE_NAME = 'kanban-candidate'
-        APP_PORT = '80'
+        APP_PORT = '18082'
         CANDIDATE_PORT = '18080'
         MEMORY_LIMIT = '256m'
         CPU_LIMIT = '0.50'
@@ -181,7 +181,7 @@ pipeline {
                           "${CONTAINER_NAME}")
                     fi
 
-                    # Run candidate on a temporary loopback port.
+                    # Start candidate on a temporary loopback port.
                     docker rm -f "${CANDIDATE_NAME}" \
                       >/dev/null 2>&1 || true
 
@@ -227,14 +227,14 @@ pipeline {
                       --restart unless-stopped \
                       --memory="${MEMORY_LIMIT}" \
                       --cpus="${CPU_LIMIT}" \
-                      -p ${APP_PORT}:8080 \
+                      -p 127.0.0.1:${APP_PORT}:8080 \
                       "${IMAGE}"; then
                         echo "New container started."
                     else
                         echo "New container failed to start."
                     fi
 
-                    # Validate the actual production endpoint.
+                    # Verify production endpoint.
                     DEPLOY_OK=false
 
                     for attempt in $(seq 1 15); do
@@ -254,7 +254,7 @@ pipeline {
                         docker rm -f "${CONTAINER_NAME}" \
                           >/dev/null 2>&1 || true
 
-                        # Restore the previous image if available.
+                        # Restore previous image if available.
                         if [ -n "${OLD_IMAGE}" ]; then
                             echo "Rolling back to ${OLD_IMAGE}"
 
@@ -263,7 +263,7 @@ pipeline {
                               --restart unless-stopped \
                               --memory="${MEMORY_LIMIT}" \
                               --cpus="${CPU_LIMIT}" \
-                              -p ${APP_PORT}:8080 \
+                              -p 127.0.0.1:${APP_PORT}:8080 \
                               "${OLD_IMAGE}"
 
                             for attempt in $(seq 1 10); do
@@ -273,6 +273,7 @@ pipeline {
                                     echo "Rollback succeeded."
                                     break
                                 fi
+
                                 sleep 2
                             done
                         fi
@@ -281,6 +282,7 @@ pipeline {
                     fi
 
                     echo "Production health check passed."
+
                     docker inspect \
                       --format='Container status: {{.State.Status}}' \
                       "${CONTAINER_NAME}"
