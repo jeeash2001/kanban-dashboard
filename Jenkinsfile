@@ -1,3 +1,4 @@
+
 pipeline {
     agent any
 
@@ -13,12 +14,13 @@ pipeline {
 
     environment {
         REGISTRY_CREDENTIALS = 'dockerhub-creds'
-        CONTAINER_NAME = 'kanban-dashboard'
-        CANDIDATE_NAME = 'kanban-candidate'
-        APP_PORT = '18082'
-        CANDIDATE_PORT = '18080'
+
         MEMORY_LIMIT = '256m'
         CPU_LIMIT = '0.50'
+
+        BLUE_PORT = '18082'
+        GREEN_PORT = '18083'
+        TEST_PORT = '18081'
     }
 
     stages {
@@ -83,7 +85,8 @@ pipeline {
                 sh '''
                     set -eu
 
-                    docker rm -f kanban-build-test 2>/dev/null || true
+                    docker rm -f kanban-build-test \
+                      >/dev/null 2>&1 || true
 
                     cleanup() {
                         docker rm -f kanban-build-test \
@@ -94,13 +97,16 @@ pipeline {
 
                     docker run -d \
                       --name kanban-build-test \
-                      -p 127.0.0.1:18081:8080 \
+                      --memory="${MEMORY_LIMIT}" \
+                      --cpus="${CPU_LIMIT}" \
+                      -p 127.0.0.1:${TEST_PORT}:8080 \
                       "${IMAGE}"
 
                     for attempt in $(seq 1 15); do
                         if curl -fsS \
-                          http://127.0.0.1:18081/health \
+                          http://127.0.0.1:${TEST_PORT}/health \
                           >/dev/null; then
+
                             echo "Image test passed."
                             exit 0
                         fi
@@ -167,37 +173,78 @@ pipeline {
             }
         }
 
-        stage('Deploy and Verify') {
+        stage('Blue-Green Deployment') {
             steps {
                 sh '''
                     set -eu
 
-                    OLD_IMAGE=""
+                    NGINX_UPSTREAM="/etc/nginx/conf.d/kanban-upstream.conf"
 
-                    if docker inspect "${CONTAINER_NAME}" \
-                      >/dev/null 2>&1; then
-                        OLD_IMAGE=$(docker inspect \
-                          --format='{{.Config.Image}}' \
-                          "${CONTAINER_NAME}")
+                    ACTIVE_PORT=$(sed -n \
+                      's/.*127.0.0.1:\\([0-9][0-9]*\\);.*/\\1/p' \
+                      "$NGINX_UPSTREAM")
+
+                    if [ "$ACTIVE_PORT" = "$BLUE_PORT" ]; then
+                        OLD_PORT="$BLUE_PORT"
+                        NEW_PORT="$GREEN_PORT"
+
+                        OLD_NAME="kanban-blue"
+                        NEW_NAME="kanban-green"
+
+                        # One-time migration of existing production name.
+                        if ! docker inspect kanban-blue \
+                          >/dev/null 2>&1 && \
+                           docker inspect kanban-dashboard \
+                          >/dev/null 2>&1; then
+
+                            docker rename kanban-dashboard kanban-blue
+                        fi
+
+                    elif [ "$ACTIVE_PORT" = "$GREEN_PORT" ]; then
+                        OLD_PORT="$GREEN_PORT"
+                        NEW_PORT="$BLUE_PORT"
+
+                        OLD_NAME="kanban-green"
+                        NEW_NAME="kanban-blue"
+
+                    else
+                        echo "Unexpected active Nginx port: $ACTIVE_PORT"
+                        exit 1
                     fi
 
-                    # Start candidate on a temporary loopback port.
-                    docker rm -f "${CANDIDATE_NAME}" \
+                    echo "Current production: $OLD_NAME on $OLD_PORT"
+                    echo "New deployment: $NEW_NAME on $NEW_PORT"
+
+                    # Ensure the old production container is running.
+                    if [ "$(docker inspect \
+                      --format='{{.State.Running}}' "$OLD_NAME")" \
+                      != "true" ]; then
+
+                        echo "Existing production container is not running."
+                        exit 1
+                    fi
+
+                    # Remove stale inactive container, if present.
+                    docker rm -f "$NEW_NAME" \
                       >/dev/null 2>&1 || true
 
+                    # Start new version alongside old production.
                     docker run -d \
-                      --name "${CANDIDATE_NAME}" \
+                      --name "$NEW_NAME" \
+                      --restart unless-stopped \
                       --memory="${MEMORY_LIMIT}" \
                       --cpus="${CPU_LIMIT}" \
-                      -p 127.0.0.1:${CANDIDATE_PORT}:8080 \
+                      -p 127.0.0.1:${NEW_PORT}:8080 \
                       "${IMAGE}"
 
+                    # Check new container health before switching traffic.
                     CANDIDATE_OK=false
 
-                    for attempt in $(seq 1 15); do
+                    for attempt in $(seq 1 30); do
                         if curl -fsS \
-                          http://127.0.0.1:${CANDIDATE_PORT}/health \
+                          "http://127.0.0.1:${NEW_PORT}/health" \
                           >/dev/null; then
+
                             CANDIDATE_OK=true
                             break
                         fi
@@ -205,42 +252,34 @@ pipeline {
                         sleep 2
                     done
 
-                    if [ "${CANDIDATE_OK}" != "true" ]; then
-                        echo "Candidate health check failed."
-                        docker logs "${CANDIDATE_NAME}" || true
-                        docker rm -f "${CANDIDATE_NAME}" || true
+                    if [ "$CANDIDATE_OK" != "true" ]; then
+                        echo "New container health check failed."
+
+                        docker logs "$NEW_NAME" || true
+                        docker rm -f "$NEW_NAME" || true
+
                         exit 1
                     fi
 
-                    # Candidate is healthy; replace current version.
-                    docker stop "${CONTAINER_NAME}" \
-                      >/dev/null 2>&1 || true
+                    echo "New container is healthy."
 
-                    docker rm "${CONTAINER_NAME}" \
-                      >/dev/null 2>&1 || true
+                    # Switch Nginx to new production.
+                    if ! sudo -n /usr/local/sbin/switch-kanban-upstream \
+                      "$NEW_PORT"; then
 
-                    docker rm -f "${CANDIDATE_NAME}" \
-                      >/dev/null 2>&1 || true
-
-                    if docker run -d \
-                      --name "${CONTAINER_NAME}" \
-                      --restart unless-stopped \
-                      --memory="${MEMORY_LIMIT}" \
-                      --cpus="${CPU_LIMIT}" \
-                      -p 127.0.0.1:${APP_PORT}:8080 \
-                      "${IMAGE}"; then
-                        echo "New container started."
-                    else
-                        echo "New container failed to start."
+                        echo "Nginx traffic switch failed."
+                        docker rm -f "$NEW_NAME" || true
+                        exit 1
                     fi
 
-                    # Verify production endpoint.
+                    # Verify application through Nginx.
                     DEPLOY_OK=false
 
                     for attempt in $(seq 1 15); do
                         if curl -fsS \
-                          http://127.0.0.1:${APP_PORT}/health \
+                          http://127.0.0.1/health \
                           >/dev/null; then
+
                             DEPLOY_OK=true
                             break
                         fi
@@ -248,46 +287,49 @@ pipeline {
                         sleep 2
                     done
 
-                    if [ "${DEPLOY_OK}" != "true" ]; then
-                        echo "Production health check failed."
-                        docker logs "${CONTAINER_NAME}" || true
-                        docker rm -f "${CONTAINER_NAME}" \
-                          >/dev/null 2>&1 || true
+                    # Roll back if public application validation fails.
+                    if [ "$DEPLOY_OK" != "true" ]; then
+                        echo "New production validation failed."
+                        echo "Switching traffic back to old production."
 
-                        # Restore previous image if available.
-                        if [ -n "${OLD_IMAGE}" ]; then
-                            echo "Rolling back to ${OLD_IMAGE}"
+                        sudo -n /usr/local/sbin/switch-kanban-upstream \
+                          "$OLD_PORT"
 
-                            docker run -d \
-                              --name "${CONTAINER_NAME}" \
-                              --restart unless-stopped \
-                              --memory="${MEMORY_LIMIT}" \
-                              --cpus="${CPU_LIMIT}" \
-                              -p 127.0.0.1:${APP_PORT}:8080 \
-                              "${OLD_IMAGE}"
+                        docker logs "$NEW_NAME" || true
 
-                            for attempt in $(seq 1 10); do
-                                if curl -fsS \
-                                  http://127.0.0.1:${APP_PORT}/health \
-                                  >/dev/null; then
-                                    echo "Rollback succeeded."
-                                    break
-                                fi
+                        docker rm -f "$NEW_NAME" || true
 
-                                sleep 2
-                            done
+                        if curl -fsS \
+                          http://127.0.0.1/health >/dev/null; then
+                            echo "Rollback successful. Old version is serving."
+                        else
+                            echo "WARNING: Old version also failed validation."
                         fi
 
                         exit 1
                     fi
 
-                    echo "Production health check passed."
+                    echo "New production deployment successful."
+
+                    # Allow a short period for existing requests to drain.
+                    sleep 5
+
+                    # Remove old version only after successful validation.
+                    docker rm -f "$OLD_NAME"
+
+                    echo "Old container removed."
+                    echo "Blue-Green deployment completed."
+
+                    docker ps
+                    docker inspect \
+                      --format='Health: {{.State.Health.Status}}' \
+                      "$NEW_NAME"
 
                     docker inspect \
-                      --format='Container status: {{.State.Status}}' \
-                      "${CONTAINER_NAME}"
+                      --format='Memory={{.HostConfig.Memory}} NanoCpus={{.HostConfig.NanoCpus}}' \
+                      "$NEW_NAME"
 
-                    docker ps --filter "name=${CONTAINER_NAME}"
+                    curl -fsS http://127.0.0.1/health
                 '''
             }
         }
@@ -295,19 +337,16 @@ pipeline {
 
     post {
         success {
-            echo 'CI/CD SUCCESS: Application deployed and verified.'
+            echo 'CI/CD SUCCESS: Blue-Green deployment completed.'
         }
 
         failure {
-            echo 'CI/CD FAILED: Review the failing stage and console output.'
+            echo 'CI/CD FAILED: Check console output and rollback logs.'
         }
 
         always {
             sh '''
                 docker rm -f kanban-build-test \
-                  >/dev/null 2>&1 || true
-
-                docker rm -f kanban-candidate \
                   >/dev/null 2>&1 || true
             '''
 
